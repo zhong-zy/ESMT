@@ -71,7 +71,7 @@ int config::freq_ewma_halflife = 0;
 bool config::placebo_inference = false;
 
 int config::index_type = 0;
-int config::shrubs_type = 0;   // fixed: single-tree layout (the CLI option was removed; not used in the paper)
+int config::shrubs_type = 0;
 int config::shrub_min_size = 4;
 int config::ADS_store_type = 0;
 
@@ -81,6 +81,8 @@ int config::shard_cnt = 1;
 int config::shard_mode = 0;
 
 int config::mbt_bucket_capacity = 65536;
+
+int config::score_buf = 1;
 
 int config::out_latency = 0;
 int config::out_breakdown = 0;

@@ -16,6 +16,10 @@ namespace workloadml {
 
         virtual void get_scores(std::vector<uint64_t> &keys, std::vector<Score> &scores)=0;
         virtual uint64_t mem_size()=0;
+
+        virtual bool samples_sealed() { return true; }
+        virtual void fill_snapshot(workloads::OpMeta &) {}
+        virtual Score get_score(const workloads::OpMeta &op) { return get_score(op.key); }
     };
 }
 

@@ -14,6 +14,7 @@
 #include <fstream>
 #include <iterator>
 #include <cstdlib>
+#include <atomic>
 #include "cpputils/size.h"
 
 namespace workloadml {
@@ -382,6 +383,26 @@ namespace workloadml {
                 }
             }
             key_list.push_back(key);
+            if (std::getenv("ESMT_DUMP_ROW") != nullptr) {
+                static FILE *row_fp = nullptr;
+                static long row_lines = 0;
+                static const long row_limit = []() {
+                    const char *v = std::getenv("ESMT_DUMP_ROW_LIMIT");
+                    return v ? std::atol(v) : 5000L;
+                }();
+                if (row_fp == nullptr) {
+                    row_fp = std::fopen(std::getenv("ESMT_DUMP_ROW"), "w");
+                }
+                if (row_fp != nullptr && row_lines < row_limit) {
+                    ++row_lines;
+                    std::fprintf(row_fp, "%llu %lld %d %zu", (unsigned long long) key,
+                                 (long long) recency, n_within_feat, data.size());
+                    for (size_t qi = 0; qi < data.size(); ++qi) {
+                        std::fprintf(row_fp, " %.6g", data[qi]);
+                    }
+                    std::fprintf(row_fp, "\n");
+                }
+            }
             return true;
         }
 
@@ -600,6 +621,11 @@ namespace workloadml {
         uint64_t N_within = 0;
         uint64_t N_all = 0;
 
+        FILE *feat_fp = nullptr;
+        long feat_lines = 0;
+        const bool snap_feat = (std::getenv("ESMT_SNAP_FEAT") != nullptr);
+        std::atomic<bool> train_sealed{false};
+
         struct PendingSample {
             uint64_t ts = 0;
             int64_t recency = 0;
@@ -691,6 +717,7 @@ namespace workloadml {
         ~ReqScoreDistance() {
             auto size = mem_size();
             std::cout << "[DistanceBuff] memory consumption: " << cpputils::getSizeStr(size) << std::endl;
+            if (feat_fp != nullptr) std::fclose(feat_fp);
         }
 
         double freq_score(uint64_t key) {
@@ -731,7 +758,8 @@ namespace workloadml {
                     ++metas[key]->n_all;
                     auto new_delta = ts - metas[key]->last_ts;
 
-                    if ((config::learning_score_option & 32) != 0 && train_data_flag) {
+                    if ((config::learning_score_option & 32) != 0 && train_data_flag
+                        && ts < (uint64_t) config::init_training_cnt) {
                         auto pit = pending_samples.find(key);
                         if (pit != pending_samples.end()) {
                             auto &snap = pit->second;
@@ -742,6 +770,24 @@ namespace workloadml {
                                              && !snap.deltas.empty()
                                              && snap.deltas.front() > (uint32_t) window_size;
                             if (!outlier_w) {
+                                if (std::getenv("ESMT_DUMP_TRAIN") != nullptr) {
+                                    static FILE *tr_fp = nullptr;
+                                    if (tr_fp == nullptr) {
+                                        tr_fp = std::fopen(std::getenv("ESMT_DUMP_TRAIN"), "w");
+                                    }
+                                    if (tr_fp != nullptr) {
+                                        std::fprintf(tr_fp, "%llu %llu %lld %lld %d %zu",
+                                                     (unsigned long long) snap.ts,
+                                                     (unsigned long long) key,
+                                                     (long long) label_w,
+                                                     (long long) snap.recency,
+                                                     snap.n_within, snap.deltas.size());
+                                        for (size_t di = 0; di < snap.deltas.size(); ++di) {
+                                            std::fprintf(tr_fp, " %u", snap.deltas[di]);
+                                        }
+                                        std::fprintf(tr_fp, "\n");
+                                    }
+                                }
                                 if (model_train.push_back(metas[key], key, snap.freq, label_w,
                                                           true, snap.recency, snap.n_within, &snap.deltas,
                                                           (config::lr_feature_set >= 2) ? &snap.extra : nullptr)) {
@@ -759,7 +805,8 @@ namespace workloadml {
                                              && new_delta < (uint64_t) window_size
                                              && !metas[key]->deltas.empty()
                                              && metas[key]->deltas.front() > (uint32_t) window_size;
-                            if (metas[key]->deltas.size() > 0 && ts >= config::init_train_pass) {
+                            if (metas[key]->deltas.size() > 0 && ts >= config::init_train_pass
+                            && ts < (uint64_t) config::init_training_cnt) {
                                 if (!outlier_r) {
                                 FSExtra ex_r;
                                 if (config::lr_feature_set >= 2) {
@@ -808,6 +855,7 @@ namespace workloadml {
 
             if (op.op == workloads::UPDATE && (config::learning_score_option & 32) != 0
                 && train_data_flag && ts >= config::init_train_pass
+                && ts < (uint64_t) config::init_training_cnt
                 && metas[key] != nullptr && !metas[key]->deltas.empty()
                 && pending_samples.size() < 4000000) {
                 PendingSample snap;
@@ -869,6 +917,9 @@ namespace workloadml {
             if (fe && metas[key] != nullptr) {
                 metas[key]->last_any_ts = ts;
             }
+            if (ts + 1 >= (int64_t) config::init_training_cnt) {
+                train_sealed.store(true);
+            }
             ++ts_;
         }
 
@@ -876,9 +927,11 @@ namespace workloadml {
 
             std::unique_lock<std::mutex> lock(buf_mtx);
 
-            if (metas[key] == nullptr || metas[key]->deltas.size() == 0) {
+            const std::shared_ptr<DistanceMeta> &M = metas[key];
+
+            if (M == nullptr || M->deltas.empty()) {
                 auto score2 = ((config::learning_score_option & 1) != 0 ? freq_score_no_lock(key) : 0);
-                score2 = ((config::learning_score_option == 4) ? (metas[key]->n_all / N_all) : score2);
+                score2 = ((config::learning_score_option == 4) ? (M->n_all / N_all) : score2);
                 return {-2.0 * window_size, score2};
             }
 
@@ -889,24 +942,33 @@ namespace workloadml {
             }
 
             if ((config::learning_score_option & 8192) != 0) {
-                if (metas[key]->pred_cache >= 0 && metas[key]->pred_n_all == metas[key]->n_all
-                    && metas[key]->pred_epoch == model_epoch) {
+                if (M->pred_cache >= 0 && M->pred_n_all == M->n_all
+                    && M->pred_epoch == model_epoch) {
                     ++infer_cache_hit_cnt;
                     auto sc2 = ((config::learning_score_option & 1) != 0 ? freq_score : 0);
-                    return {-metas[key]->pred_cache, sc2};
+                    return {-M->pred_cache, sc2};
                 }
             }
 
             FSExtra ex;
             const bool fs_on = (config::lr_feature_set > 0);
             if (config::lr_feature_set >= 2) {
-                compute_fs_features(metas[key].get(), ts_, window_size, &ex);
+                compute_fs_features(M.get(), ts_, window_size, &ex);
+            }
+            if (std::getenv("ESMT_DUMP_FEAT") != nullptr) {
+                std::vector<uint32_t> dl;
+                int nd = static_cast<int>(M->deltas.size());
+                if (nd > config::max_delta_cnt) nd = config::max_delta_cnt;
+                dl.assign(M->deltas.begin(), M->deltas.begin() + nd);
+                dump_feat(key, static_cast<uint64_t>(ts_),
+                          static_cast<int64_t>(ts_) - static_cast<int64_t>(M->last_ts),
+                          M->n_within, dl, ex);
             }
             model_score.next();
-            model_score.push_back(metas[key], key, freq_score, 0, false,
+            model_score.push_back(M, key, freq_score, 0, false,
                                   (fs_on || (config::learning_score_option & 32) != 0)
-                                      ? static_cast<int64_t>(ts_) - static_cast<int64_t>(metas[key]->last_ts) : 0,
-                                  metas[key]->n_within, nullptr,
+                                      ? static_cast<int64_t>(ts_) - static_cast<int64_t>(M->last_ts) : 0,
+                                  M->n_within, nullptr,
                                   (config::lr_feature_set >= 2) ? &ex : nullptr);
             lock.unlock();
             model_score.rank();
@@ -915,15 +977,15 @@ namespace workloadml {
             score = expm1(score);
 
             if ((config::learning_score_option & 4096) != 0) {
-                int nwv = metas[key]->n_within;
+                int nwv = M->n_within;
                 double R = (nwv > 0) ? (double) window_size / nwv : 2.0 * window_size;
                 score = std::sqrt(std::max(score, 1.0) * R);
             }
             auto score2 = ((config::learning_score_option & 1) != 0 ? freq_score : 0);
             if ((config::learning_score_option & 8192) != 0) {
-                metas[key]->pred_cache = score;
-                metas[key]->pred_n_all = metas[key]->n_all;
-                metas[key]->pred_epoch = model_epoch;
+                M->pred_cache = score;
+                M->pred_n_all = M->n_all;
+                M->pred_epoch = model_epoch;
             }
             return {-score, score2};
         }
@@ -1069,6 +1131,111 @@ namespace workloadml {
 
             train_data_flag = rolling_train ? true : false;
             model_score.booster = model_train.booster;
+        }
+
+
+
+        bool samples_sealed() {
+            return train_sealed.load();
+        }
+
+        void fill_snapshot(workloads::OpMeta &op) {
+            if (!snap_feat || op.op != workloads::UPDATE) return;
+            std::unique_lock<std::mutex> lock(buf_mtx);
+            const std::shared_ptr<DistanceMeta> &M = metas[op.key];
+            if (M == nullptr) return;
+            op.snap_recency = static_cast<int64_t>(op.ts) - static_cast<int64_t>(M->last_ts);
+            op.snap_n_within = M->n_within;
+            op.snap_freq = freq_score_no_lock(op.key);
+            int nd = static_cast<int>(M->deltas.size());
+            if (nd > 8) nd = 8;
+            for (int i = 0; i < nd; ++i) op.snap_delta[i] = M->deltas[i];
+            op.snap_ndelta = nd;
+            FSExtra fex;
+            if (config::lr_feature_set >= 2) {
+                compute_fs_features(M.get(), static_cast<uint64_t>(op.ts), window_size, &fex);
+            }
+            op.fs[0] = fex.since_any;
+            op.fs[1] = fex.log_n_read;
+            op.fs[2] = fex.density;
+            op.fs[3] = fex.has_hist;
+            op.fs[4] = fex.edc[0];
+            op.fs[5] = fex.edc[1];
+            op.fs[6] = fex.edc[2];
+            op.fs[7] = fex.edc[3];
+            op.fs[8] = fex.since_write;
+            op.fs[9] = fex.n_write_within;
+            op.fs[10] = fex.n_within_log;
+            op.fs[11] = fex.mean_gap_win_log;
+            op.fs[12] = fex.mean_gap_all_log;
+            op.fs[13] = fex.rel_rec_all_log;
+            op.fs[14] = fex.rel_rec_win_log;
+            op.snap_valid = true;
+        }
+
+        Score get_score(const workloads::OpMeta &op) {
+            if (!op.snap_valid) {
+                return get_score(op.key);
+            }
+            std::unique_lock<std::mutex> lock(buf_mtx);
+            auto score2 = ((config::learning_score_option & 1) != 0 ? op.snap_freq : 0.0);
+            if (op.snap_ndelta == 0 || model_score.booster == nullptr) {
+                return {-2.0 * window_size, score2};
+            }
+            FSExtra fex;
+            fex.since_any = op.fs[0];
+            fex.log_n_read = op.fs[1];
+            fex.density = op.fs[2];
+            fex.has_hist = static_cast<int>(op.fs[3]);
+            fex.edc[0] = op.fs[4];
+            fex.edc[1] = op.fs[5];
+            fex.edc[2] = op.fs[6];
+            fex.edc[3] = op.fs[7];
+            fex.since_write = op.fs[8];
+            fex.n_write_within = static_cast<int>(op.fs[9]);
+            fex.n_within_log = op.fs[10];
+            fex.mean_gap_win_log = op.fs[11];
+            fex.mean_gap_all_log = op.fs[12];
+            fex.rel_rec_all_log = op.fs[13];
+            fex.rel_rec_win_log = op.fs[14];
+            std::vector<uint32_t> dl(op.snap_delta, op.snap_delta + op.snap_ndelta);
+            dump_feat(op.key, static_cast<uint64_t>(op.ts), op.snap_recency, op.snap_n_within, dl, fex);
+            model_score.next();
+            model_score.push_back(nullptr, op.key, op.snap_freq, 0, false, op.snap_recency,
+                                  op.snap_n_within, &dl,
+                                  (config::lr_feature_set >= 2) ? &fex : nullptr);
+            lock.unlock();
+            model_score.rank();
+            auto score = model_score.scores[0];
+            last_raw_score = score;
+            score = expm1(score);
+            return {-score, score2};
+        }
+
+
+        void dump_feat(uint64_t key, uint64_t ts, int64_t recency, int n_within,
+                       const std::vector<uint32_t> &dl, const FSExtra &ex) {
+            static const long kLimit = []() {
+                const char *s = std::getenv("ESMT_DUMP_FEAT_LIMIT");
+                return s ? std::atol(s) : 3000L;
+            }();
+            if (feat_fp == nullptr) {
+                const char *p = std::getenv("ESMT_DUMP_FEAT");
+                if (p == nullptr) return;
+                feat_fp = std::fopen(p, "w");
+                if (feat_fp == nullptr) return;
+            }
+            if (feat_lines >= kLimit) return;
+            ++feat_lines;
+            std::fprintf(feat_fp, "%llu %llu %lld %d %zu", (unsigned long long) key,
+                         (unsigned long long) ts, (long long) recency, n_within, dl.size());
+            for (size_t i = 0; i < dl.size(); ++i) std::fprintf(feat_fp, " %u", dl[i]);
+            std::fprintf(feat_fp, " | %g %g %g %d %g %g %g %g %g %d %g %g %g %g %g\n",
+                         ex.since_any, ex.log_n_read, ex.density, ex.has_hist,
+                         ex.edc[0], ex.edc[1], ex.edc[2], ex.edc[3],
+                         ex.since_write, ex.n_write_within, ex.n_within_log,
+                         ex.mean_gap_win_log, ex.mean_gap_all_log,
+                         ex.rel_rec_all_log, ex.rel_rec_win_log);
         }
     };
 }

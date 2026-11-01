@@ -34,6 +34,14 @@ namespace workloads {
         int64_t ts = 0;
 
         workloadml::Score priority = 0;
+
+        double fs[16] = {0};
+        int64_t snap_recency = 0;
+        int snap_n_within = 0;
+        double snap_freq = 0;
+        uint32_t snap_delta[8] = {0};
+        int snap_ndelta = 0;
+        bool snap_valid = false;
         double valid_time = 0;
         std::chrono::steady_clock::time_point proof_latency_st, proof_latency_ed;
         std::chrono::steady_clock::time_point pi_latency_st, pi_latency_ed;

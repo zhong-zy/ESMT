@@ -29,6 +29,7 @@ int main(int argc, char *argv[]) {
             ("shard_cnt", po::value<int>()->default_value(1), "number of shards (each shard = one independent Merkle tree + maintenance thread); 1=off")
             ("shard_mode", po::value<int>()->default_value(0), "0=hash(key)%%S, 1=equal key range")
             ("mbt_bucket_capacity", po::value<int>()->default_value(65536), "MBT fixed bucket count (IndexBucketTree; default 65536 = legacy)")
+            ("score_buf", po::value<int>()->default_value(1), "handshake buffer between submission and scoring; <=0 means unbounded (total ops)")
             ("out_latency", po::value<int>()->default_value(0), "1 = also report the latency columns (avg / p90 / p99)")
             ("out_breakdown", po::value<int>()->default_value(0), "1 = also report the phase breakdown (request / scheduling / Merkle path update)")
             ("out_sched_tput", po::value<int>()->default_value(0), "1 = also report the schedule generation throughput")
@@ -135,6 +136,10 @@ int main(int argc, char *argv[]) {
     config::shard_cnt = vm["shard_cnt"].as<int>();
     config::shard_mode = vm["shard_mode"].as<int>();
     config::mbt_bucket_capacity = vm["mbt_bucket_capacity"].as<int>();
+    config::score_buf = vm["score_buf"].as<int>();
+    if (vm["out_sched_tput"].as<int>() != 0 && vm["score_buf"].defaulted()) {
+        config::score_buf = -1;
+    }
     config::out_latency = vm["out_latency"].as<int>();
     config::out_breakdown = vm["out_breakdown"].as<int>();
     config::out_sched_tput = vm["out_sched_tput"].as<int>();

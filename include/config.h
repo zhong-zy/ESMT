@@ -63,6 +63,8 @@ namespace config {
 
     extern int mbt_bucket_capacity;
 
+    extern int score_buf;
+
     extern int out_latency;
     extern int out_breakdown;
     extern int out_sched_tput;

@@ -334,9 +334,15 @@ namespace workloadsim {
                 fflush(stdout);
                 lock.unlock();
 #endif
+                if (update_mode == P4_new_base && op.ts >= (int64_t) config::init_training_cnt
+                    && !init_train_finished) {
+                    std::unique_lock<std::mutex> lk(init_training_mtx);
+                    init_training_cond.wait(lk, [&] { return init_train_finished; });
+                }
                 if (update_mode == P4_new_base) {
                     auto feature_prepare_st = steady_clock::now();
                     req_score->push_req(op);
+                    req_score->fill_snapshot(op);
                     if (req_score_placebo != nullptr) req_score_placebo->push_req(op);
                     auto feature_prepare_ed = steady_clock::now();
                     auto feature_prepare_duration = (cnt >= config::init_training_cnt) ? duration_cast<microseconds>(feature_prepare_ed-feature_prepare_st).count() : 0;
@@ -528,10 +534,11 @@ namespace workloadsim {
                         if (op.op == UPDATE) {
 
                             workloadml::Score sc_;
+
                             if (init_train_finished && workloadml::g_score_trace.try_get(op.key, sc_)) {
                                 op.priority = sc_;
                             } else {
-                                sc_ = req_score->get_score(op.key);
+                                sc_ = req_score->get_score(op);
                                 op.priority = sc_;
                                 if (init_train_finished) workloadml::g_score_trace.record(op.key, sc_);
                             }
@@ -855,6 +862,11 @@ namespace workloadsim {
 
                     if (update_mode == P1_OfflineTrain || update_mode == P3_FreqScoreLearnValid || update_mode == P2_BinaryModel || (update_mode == P4_new_base && config::new_mode == NEW_MODE::distance)) {
                         cout << "process " << cnt << " datas, reads: " << read_cnt << endl;
+                        if (update_mode == P4_new_base) {
+                            while (!req_score->samples_sealed()) {
+                                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                            }
+                        }
                         start_init_training();
                         unique_lock<mutex> init_training_lock(init_training_mtx);
                         init_training_cond.wait(init_training_lock, [&]{return init_train_finished;});

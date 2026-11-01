@@ -3,6 +3,7 @@
 #define INDEX_MAINTAIN_DB_MBPT_H
 
 #include <utility>
+#include <cstdlib>
 
 #include <atomic>
 #include <memory>
@@ -287,7 +288,11 @@ namespace workloadsim {
 
             req_buf_pc.name = "req_buf_pc";
             req_buf_pc.msgs_buffer_size = 1;
-            score_pc.msgs_buffer_size = 1;
+            {
+                const char *sb = std::getenv("ESMT_SCORE_BUF");
+                int64_t n = (sb != nullptr) ? std::atoll(sb) : config::score_buf;
+                score_pc.msgs_buffer_size = (n > 0) ? n : config::total_ops;
+            }
 #ifdef ADS_QUEUE_LIMITED
             ads_pc.set_limit_height(config::ads_queue_limit_height);
 #endif
